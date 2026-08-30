@@ -1,6 +1,7 @@
 import express from 'express';
 import { loadConfig } from './config';
 import { MatrixClient } from './matrix-client';
+import { registerSlackRoutes } from './slack-routes';
 import { registerTelegramCompatRoutes } from './telegram-routes';
 
 const cfg = loadConfig();
@@ -14,6 +15,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 registerTelegramCompatRoutes(app, cfg, matrix);
+registerSlackRoutes(app, cfg, matrix);
 
 app.listen(cfg.PORT, () => {
   console.log(`matrix-sender слушает порт ${cfg.PORT}`);

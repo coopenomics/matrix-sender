@@ -60,6 +60,7 @@ export interface MatrixClientOptions {
 export class MatrixClient {
   private readonly http: AxiosInstance;
   private readonly homeserverNorm: string;
+  private readonly aliasCache = new Map<string, string>();
   private cachedToken: string | null = null;
   private tokenExpiresAt = 0;
   private cacheUsername: string | null = null;
@@ -132,13 +133,65 @@ export class MatrixClient {
     return token;
   }
 
-  async sendTextToRoom(roomId: string, body: string, username: string, password: string): Promise<string> {
+  /**
+   * Алиас (`#alarm:server`) в идентификатор комнаты. Отправлять по алиасу нельзя —
+   * Matrix принимает только `!id:server`, — а задавать в настройках алиас удобнее:
+   * он читаемый и не меняется при пересоздании конфигурации.
+   */
+  private async resolveRoomAlias(alias: string, accessToken: string): Promise<string> {
+    const cached = this.aliasCache.get(alias);
+    if (cached) {
+      return cached;
+    }
+    try {
+      const response = await this.http.get<{ room_id: string }>(
+        `/_matrix/client/v3/directory/room/${encodeURIComponent(alias)}`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      const roomId = response.data?.room_id;
+      if (!roomId) {
+        throw new Error('Matrix не вернул room_id');
+      }
+      this.aliasCache.set(alias, roomId);
+      return roomId;
+    } catch (err: unknown) {
+      throw new Error(`Не удалось разрешить алиас комнаты «${alias}» — ${matrixErrDetail(err)}`);
+    }
+  }
+
+  /**
+   * Вход в комнату. Бота, которого не пригласили или который вылетел, Matrix
+   * встречает 403 на отправке — и тревога молча не доходит. Поэтому при отказе
+   * пробуем войти сами: в открытую комнату это срабатывает, в закрытую вернёт
+   * внятную ошибку вместо тишины.
+   */
+  private async joinRoom(roomIdOrAlias: string, accessToken: string): Promise<void> {
+    await this.http.post(
+      `/_matrix/client/v3/join/${encodeURIComponent(roomIdOrAlias)}`,
+      {},
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+  }
+
+  async sendTextToRoom(
+    roomId: string,
+    body: string,
+    username: string,
+    password: string,
+    formattedBody?: string
+  ): Promise<string> {
     const accessToken = await this.ensureAccessToken(username, password);
+    const target = roomId.startsWith('#') ? await this.resolveRoomAlias(roomId, accessToken) : roomId;
     const txnId = `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+    // formatted_body — то же сообщение с разметкой. body остаётся обязательным:
+    // его показывают клиенты без поддержки HTML и уведомления на телефоне.
+    const content: Record<string, unknown> = formattedBody
+      ? { msgtype: 'm.text', body, format: 'org.matrix.custom.html', formatted_body: formattedBody }
+      : { msgtype: 'm.text', body };
     try {
       const response = await this.http.put<MatrixSendEventResponse>(
-        `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${encodeURIComponent(txnId)}`,
-        { msgtype: 'm.text', body },
+        `/_matrix/client/v3/rooms/${encodeURIComponent(target)}/send/m.room.message/${encodeURIComponent(txnId)}`,
+        content,
         { headers: { Authorization: `Bearer ${accessToken}` } }
       );
       const eventId = response.data?.event_id;
@@ -154,19 +207,48 @@ export class MatrixClient {
         await clearMatrixTokenFile(this.opts.tokenCachePath).catch(() => undefined);
         throw err;
       }
+      if (axios.isAxiosError(err) && err.response?.status === 403) {
+        // Бот не в комнате — входим и пробуем ещё раз. Один раз: если и вход не
+        // помог, комната закрытая, и повторять бессмысленно.
+        try {
+          await this.joinRoom(roomId, accessToken);
+        } catch (joinErr: unknown) {
+          throw new Error(
+            `Бот не состоит в комнате «${roomId}» и войти не смог — ${matrixErrDetail(joinErr)}. ` +
+              'Пригласите его в комнату или сделайте её открытой.'
+          );
+        }
+        const retryTxnId = `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+        const retry = await this.http.put<MatrixSendEventResponse>(
+          `/_matrix/client/v3/rooms/${encodeURIComponent(target)}/send/m.room.message/${encodeURIComponent(retryTxnId)}`,
+          content,
+          { headers: { Authorization: `Bearer ${accessToken}` } }
+        );
+        const retryEventId = retry.data?.event_id;
+        if (!retryEventId) {
+          throw new Error('Matrix не вернул event_id после входа в комнату');
+        }
+        return retryEventId;
+      }
       const detail = matrixErrDetail(err);
       throw new Error(`Логин в Matrix прошёл, отправка в комнату «${roomId}» не удалась — ${detail}`);
     }
   }
 
-  async sendTextToRoomRetry(roomId: string, body: string, username: string, password: string): Promise<string> {
+  async sendTextToRoomRetry(
+    roomId: string,
+    body: string,
+    username: string,
+    password: string,
+    formattedBody?: string
+  ): Promise<string> {
     try {
-      return await this.sendTextToRoom(roomId, body, username, password);
+      return await this.sendTextToRoom(roomId, body, username, password, formattedBody);
     } catch (first: unknown) {
       if (!axios.isAxiosError(first) || first.response?.status !== 401) {
         throw first instanceof Error ? first : new Error(String(first));
       }
-      return await this.sendTextToRoom(roomId, body, username, password);
+      return await this.sendTextToRoom(roomId, body, username, password, formattedBody);
     }
   }
 }
