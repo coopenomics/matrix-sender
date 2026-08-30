@@ -51,6 +51,24 @@ receivers:
 Alertmanager соберёт адрес как `<api_url>/bot<bot_token>/sendMessage`, поэтому
 `ACCESS_TOKEN` пересыльщика должен начинаться с `bot`.
 
+## Semaphore и другие отправители Slack
+
+```
+POST /slack/<ACCESS_TOKEN>
+POST /services/<ACCESS_TOKEN>
+{"text": "…", "attachments": [{"title": "…", "text": "…", "color": "good"}]}
+```
+
+Отдельный маршрут нужен потому, что у Semaphore адрес Telegram зашит в код —
+всегда `api.telegram.org`, переопределить его в настройках нечем, и с
+блокировкой этих адресов уведомления о прогонах перестали доходить вовсе. А вот
+адрес Slack-вебхука Semaphore берёт из настроек, значит его можно направить сюда.
+
+Что делает приёмник: разворачивает ссылки Slack (`<адрес|подпись>`), переносит
+`fields` парами «название: значение», а `color` показывает значком — по нему
+видно исход, не читая текст. Комната берётся из `?room=`, из поля `channel` или
+из `MATRIX_DEFAULT_ROOM`. Отвечает `ok` простым текстом, как настоящий Slack.
+
 ## Настройки
 
 Смотри `.env.example`. Развёртывание — `playbooks/matrix-sender/setup.yaml`.
